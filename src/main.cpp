@@ -8,6 +8,8 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.hpp"
+#include "behavior.cpp"
 
 using namespace std;
 
@@ -18,6 +20,9 @@ using json = nlohmann::json;
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
+double ref_v = 0.0;
+int lane = 1;
+BehaviorPlanner behaviorPlanner;
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -176,7 +181,7 @@ int main() {
   // Waypoint map to read from
   string map_file_ = "../data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
-  double max_s = 6945.554;
+    double max_s = 6945.554;
 
   ifstream in_map_(map_file_.c_str(), ifstream::in);
 
@@ -199,6 +204,7 @@ int main() {
   	map_waypoints_dx.push_back(d_x);
   	map_waypoints_dy.push_back(d_y);
   }
+    
 
   h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
@@ -236,14 +242,150 @@ int main() {
 
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
-
-          	json msgJson;
-
+            auto prev_path_size = previous_path_x.size();
+            if (prev_path_size > 0) {
+                car_s = end_path_s;
+            }
+            
+            // Check if ahead car is too close to the vehicle, if yes then adjust speed to avoid collission
+            bool too_close = false;
+            for (unsigned int i =0; i < sensor_fusion.size(); ++i) {
+                float d = sensor_fusion[i][6];
+                if (d > (2+(4*lane-2)) && d < ((2+(4*lane+2)))) {
+                    float vx = sensor_fusion[i][3];
+                    float vy = sensor_fusion[i][4];
+                    double check_car_s = sensor_fusion[i][5];
+                    double check_speed = sqrt(vx*vx + vy*vy);
+                    check_car_s += (double) prev_path_size * .02 * check_speed;
+                     if ((check_car_s > car_s) && (check_car_s - car_s <= 70)) {
+                         int next_lane = behaviorPlanner.planLane(car_s, car_d, sensor_fusion, prev_path_size);
+                         // Change lane if it is next lane else don't change it.
+                         if (fabs(next_lane - lane) == 1) {
+                             lane = next_lane;
+                         }
+                     }
+                    if ((check_car_s > car_s) && (check_car_s - car_s < 30)) {
+                        too_close = true;
+                    }
+                }
+            }
+            
+            // If too close to ahead vehicle then decrease reference velocity by .224m/s for every cycle.
+            if (too_close) {
+                 ref_v -= .224;
+            } else if (ref_v < 49.5) {
+                // Else increase speed by .224 m/s to have a smooth transition.
+                ref_v += .224;
+            }
+            
+            // Next anchor points that will be tangent to previous path
+            vector<double> tang_pts_x;
+            vector<double> tang_pts_y;
+            // Reference x, y and yaw values
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+            // Create anchor points path with a reference of prev path axes.
+            if (prev_path_size < 2) {
+                double prev_car_x = car_x - cos(car_yaw);
+                double prev_car_y = car_y  - sin(car_yaw);
+                tang_pts_x.push_back(prev_car_x);
+                tang_pts_x.push_back(car_x);
+                tang_pts_y.push_back(prev_car_y);
+                tang_pts_y.push_back(car_y);
+            } else {
+                double prev_car_x  = previous_path_x[prev_path_size -2];
+                double prev_car_y = previous_path_y[prev_path_size -2];
+                ref_x = previous_path_x[prev_path_size -1];
+                ref_y = previous_path_y[prev_path_size -1];
+                ref_yaw = atan2(ref_y - prev_car_y, ref_x - prev_car_x);
+                tang_pts_x.push_back(prev_car_x);
+                tang_pts_x.push_back(ref_x);
+                tang_pts_y.push_back(prev_car_y);
+                tang_pts_y.push_back(ref_y);
+            }
+            
+            cout << "Next lane is "<< lane << endl;
+            // Add next points on anchor in intervals of 30, 60 and 90m.
+            vector<double> next_wp0 = getXY(car_s + 30, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s + 60, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s + 90, 4*lane+2, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            tang_pts_x.push_back(next_wp0[0]);
+            tang_pts_x.push_back(next_wp1[0]);
+            tang_pts_x.push_back(next_wp2[0]);
+            tang_pts_y.push_back(next_wp0[1]);
+            tang_pts_y.push_back(next_wp1[1]);
+            tang_pts_y.push_back(next_wp2[1]);
+            
+            // Change axes of next path with Car pose
+            for (unsigned int i=0; i < tang_pts_x.size(); ++i)
+            {
+                double shift_x = tang_pts_x[i] - ref_x;
+                double shift_y = tang_pts_y[i] - ref_y;
+                
+                tang_pts_x[i] = shift_x * cos(0-ref_yaw) - shift_y * sin(0-ref_yaw);
+                tang_pts_y[i] = shift_x * sin(0 - ref_yaw) + shift_y * cos(0 - ref_yaw);
+                
+            }
+            
+            // Create next path with a combination of anchor points + previous path
           	vector<double> next_x_vals;
           	vector<double> next_y_vals;
-
-
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+            for (unsigned int i =0; i < prev_path_size; ++i)
+            {
+                next_x_vals.push_back(previous_path_x[i]);
+                next_y_vals.push_back(previous_path_y[i]);
+            }
+            
+            // Add all the anchor points on spline to predict next remaining points on trajectory (trajectory should be of 50 points).
+            // s value of trajectory should be 30m and generate points for that trajectory.
+            tk::spline s;
+            s.set_points(tang_pts_x, tang_pts_y);
+            double target_x = 30;
+            double target_y = s(target_x);
+            double target_dist = sqrt(target_x * target_x + target_y * target_y);
+            
+            // Generate next remaining points using spline
+            double x_add_on = 0;
+            for (int i =0; i < 50 - prev_path_size; ++i)
+            {
+                // Num of points will change as per change in velocity of the vehicle.
+                double N = (target_dist / ((ref_v * .02)/2.24));
+                double x_point = x_add_on + target_x / N;
+                double y_point = s(x_point);
+                x_add_on = x_point;
+                
+                double x_ref = x_point;
+                double y_ref = y_point;
+                
+                x_point = x_ref* cos(ref_yaw) - y_ref * sin(ref_yaw);
+                y_point = x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw);
+                
+                x_point += ref_x;
+                y_point += ref_y;
+                next_x_vals.push_back(x_point);
+                next_y_vals.push_back(y_point);
+                // Change reference velocity of the car if it is too close or not, to avoid sudden accelaration/deacceleration.
+                if (too_close) {
+                    ref_v -= .112;
+                } else if (ref_v < 49.5) {
+                    ref_v += .112;
+                }
+                
+            }
+//              // TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+//            double dist_inc = 0.3;
+//            double next_s = car_s;
+//            double next_d = car_d;
+//            for(int i = 0; i < 50; i++)
+//            {
+//                next_s = car_s + i * dist_inc;
+//                next_d = car_d;
+//                vector<double> next_XY = getXY(next_s, next_d, map_waypoints_s, map_waypoints_x, map_waypoints_y);
+//                next_x_vals.push_back(next_XY[0]);
+//                next_y_vals.push_back(next_XY[1]);
+//            }
+            json msgJson;
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
